@@ -1,47 +1,77 @@
 ---
 name: grove-workflow
 description: |
-  Manage git worktrees with the grove CLI. Use when cloning a repository
-  (prefer `grove init` over `git clone`), starting a new feature branch,
-  switching between in-progress work, checking out a pull request, cleaning
-  up stale worktrees, or when you encounter a project that has a bare clone
-  alongside sibling worktree directories. Covers detection of grove-managed
-  repos and how to handle pre-existing non-grove repositories.
+  Manage git worktrees with the grove CLI for fast multi-branch
+  workflows - work on several branches simultaneously without stashing
+  or branch-switching. Use this skill whenever the user asks to clone a
+  repository (prefer `grove init` over `git clone`), start a new feature
+  or bugfix branch, switch between in-progress branches, check out a
+  pull request, or clean up merged worktrees. Also use it when you land
+  in a project that already has a bare-clone-plus-worktrees layout.
+  Trigger this skill even when the user does not say "grove" or
+  "worktree" by name - any task that involves cloning, branching,
+  juggling several in-flight changes, or PR review is a strong signal.
+  Covers detection of grove-managed repos, agent-friendly
+  non-interactive patterns (`--path-only`, `--json`), and handling
+  pre-existing non-grove repos.
 ---
 
 # Grove Workflow
 
-## When to use this skill
+Grove is a CLI that wraps `git worktree` plumbing into a workflow. Every branch lives in its own directory next to a shared bare clone, so many in-progress branches can be checked out at once - no stashing, no `git switch` shuffle, no accidentally testing the wrong tree. Grove owns the project layout and the bookkeeping; you keep using `git`, `gh`, and the rest of your normal tools from inside each worktree.
 
-Use this skill whenever the task involves:
+The full reference lives in `grove --help` (and `grove <subcommand> --help` for individual commands). This skill summarizes what an agent needs to use grove confidently.
 
-- Cloning a repository to start working locally
-- Starting a new feature branch or switching between in-progress branches
-- Checking out a pull request to review or extend it
-- Cleaning up worktrees after work merges
-- Running commands inside a project that has a bare-clone-plus-worktrees layout
+## When this skill is loaded, expect tasks like
 
-## What grove is
+- "Clone this repo and start working on X"
+- "Switch to my login branch"
+- "Check out PR 142"
+- "Clean up the worktrees I'm done with"
+- "Try a quick experiment on a new branch"
+- Anything inside a project that has a `<name>.git/` bare clone next to worktree directories
 
-Grove is a CLI that wraps `git worktree` into a workflow. Every branch lives in its own directory next to a shared bare clone, so many in-progress branches can be checked out simultaneously without stashing or switching. Grove owns the repo layout, branch tracking, PR checkout, upstream sync, and cleanup. The user keeps using `git`, `gh`, and the rest of their normal tooling from inside each worktree.
+If the user is in plain `git clone` territory and grove is not yet involved, see **Pre-existing non-grove repo** below before running grove commands.
 
-Full reference: the repo `README.md`. This skill summarizes the parts an agent needs.
+## Agent-mode rule of thumb
 
-## Detection: is this repo grove-managed?
+In a non-interactive CLI agent context (no TTY, no shell integration), keep these two patterns ready:
 
-Before suggesting `grove` commands or making a destructive change, check whether you are in a grove-managed project. Any one of these is sufficient:
+```bash
+# Get a worktree path without spawning a shell:
+WORKTREE=$(grove go feature/login --path-only)
+cd "$WORKTREE"
 
-1. The `GROVE_REPO` environment variable is set.
-2. `grove list` succeeds when run from anywhere in the tree (grove auto-discovers the project root via parent traversal).
-3. A `<name>.git/` directory (a bare clone) sits at the project root, sibling to one or more worktree directories.
-4. A `.groverc` file exists at the project root.
-5. `git rev-parse --is-bare-repository` returns `true` from inside the `<name>.git/` directory.
+# Enumerate worktrees programmatically:
+grove list --json
+```
 
-If none of these hold, treat the repo as a normal git clone and follow **Pre-existing non-grove repo** below.
+Without `--path-only`, `grove go` either launches a child shell (which an agent can't navigate from the parent process) or errors on the fuzzy picker (no TTY to read from). Without `--json`, you would be screen-scraping a human-formatted table whose layout is allowed to change.
+
+## Detection: am I in a grove-managed project?
+
+Figure out the repo's shape before running anything. Cheapest checks first:
+
+1. `GROVE_REPO` is set in the environment - grove already discovered the project on a previous command in this shell.
+2. `grove list` exits 0 - the most authoritative test, since grove walks up from the cwd to find the project root.
+3. A `<name>.git/` directory exists at some ancestor path, sitting alongside one or more worktree directories.
+4. A `.groverc` lives at the project root.
+5. From inside `<name>.git/`, `git rev-parse --is-bare-repository` returns `true`.
+
+If none of these hold you are in a normal `git clone` (or no repo at all) - go to **Pre-existing non-grove repo**.
+
+## Triage: what to do based on what you found
+
+| Situation | Action |
+|---|---|
+| Empty directory, user wants to start | `grove init <url>` |
+| grove-managed repo (any of 1-5 above) | Use the grove commands below |
+| Plain `git clone`, user wants the grove workflow | Recommend a `grove init` re-clone (default); accept fall-back to plain git if they decline |
+| Plain `git clone`, user did not ask for grove | Don't migrate. Use plain git. |
+
+The last row matters - re-cloning a user's repo without being asked is surprising in the bad way.
 
 ## Cloning a new repo
-
-Always prefer `grove init` over `git clone` when starting fresh:
 
 ```bash
 grove init https://github.com/owner/repo.git
@@ -55,25 +85,25 @@ grove add main             # check out main as a worktree
 grove add feature/login    # start a new feature branch
 ```
 
-You do not need to `git clone` first - `grove init` does the clone for you.
+Skip `git clone`. `grove init` does the cloning, and a normal `git clone` produces a layout grove cannot drive.
 
 ## Pre-existing non-grove repo
 
-If the user is already working in a normal `git clone` and grove's workflow would help:
+When the user is already working in a normal clone and the workflow would benefit from grove (multiple branches in flight, frequent PR review, parallel agent work), the default recommendation is to re-clone with `grove init`. The data lives on the remote, so a re-clone is a cheap migration.
 
-**Default recommendation:** suggest re-cloning with `grove init`. Concrete steps:
+Migration recipe:
 
-1. Confirm the working tree is clean: `git status`. If anything is uncommitted, ask the user to commit, push, or stash first.
-2. Verify all local branches with unpushed commits have been pushed to a remote (or the user has accepted the loss).
-3. From a sibling directory, run `grove init <remote-url>` to create the new layout.
-4. Verify with `grove list` from inside the new directory.
-5. Only after the user confirms the new layout is working, delete the old clone.
+1. `git status` - if anything is uncommitted, stop and ask the user to commit, push, or stash.
+2. Confirm any branch with unpushed commits has been pushed (or the user has accepted the loss).
+3. From a sibling directory, run `grove init <remote-url>`.
+4. From inside the new directory, `grove list` to confirm the layout.
+5. After the user confirms the new directory works, delete the old clone.
 
-**Override:** if the user declines the re-clone, fall back to plain `git` and `git worktree` commands. Do not force the migration. Note in your response that `grove` commands will not work in this repo without re-cloning.
+Accept a fall-back to plain `git` if the user declines. Reasonable reasons they might: shared machine, exotic remote setup, submodules grove doesn't manage, work in progress they aren't ready to push, CI working directory. Note in your response that grove commands won't work in this repo without re-cloning, then move on - don't keep nagging.
 
 ## Starting new work
 
-Create a worktree for a new branch:
+Named branch:
 
 ```bash
 grove add feature/new-thing
@@ -82,100 +112,94 @@ grove add feature/new-thing
 Track an existing remote branch:
 
 ```bash
-grove add feature/existing-thing --track origin/feature/existing-thing
+grove add feature/existing --track origin/feature/existing
 ```
 
-Let grove generate an adjective-noun name (handy for short exploratory branches):
+Auto-named (good for short experiments):
 
 ```bash
 grove add
-# Example: creates `quiet-meadow/` with branch `quiet-meadow`.
-# If .groverc has `branchPrefix: "alice"`, branch becomes `alice/quiet-meadow`;
-# the worktree directory stays `quiet-meadow/`.
+# Creates e.g. quiet-meadow/ on branch quiet-meadow.
+# If .groverc has branchPrefix: "alice", branch becomes alice/quiet-meadow;
+# the directory stays quiet-meadow/.
 ```
 
-`branchPrefix` is alphanumeric only.
+`branchPrefix` accepts only alphanumerics, and the directory name never gets the prefix.
 
-Run `grove sync` first if the bare clone is stale and the new branch is forking from `main`/`master`:
+If the bare clone might be stale, refresh before branching from the trunk:
 
 ```bash
-grove sync                   # default branch
+grove sync                   # default branch (main / master)
 grove sync --branch develop  # specific branch
 ```
 
-`grove sync` only updates the bare clone. Existing worktrees are unaffected; pull or rebase them as usual.
+`grove sync` updates only the bare clone's ref for that branch. Existing worktrees are unaffected and still need their own `git pull` / `git rebase` if you want them on the new tip - one stale worktree shouldn't block syncing the rest of the project.
 
 ## Switching to existing work
 
-**Interactive (humans):**
+Interactive (humans, with shell integration installed):
 
 ```bash
-grove go feature/login
-grove go login           # partial match works
-grove go                 # fuzzy picker if a TTY is attached
+grove go feature/login    # exact match
+grove go login            # partial match
+grove go                  # fuzzy picker (needs TTY)
 ```
 
-**Non-interactive (agents) - IMPORTANT:**
-
-In a CLI agent context with no TTY and no shell integration installed, use `--path-only` to get just the worktree directory and `cd` into it yourself:
+Non-interactive (agents):
 
 ```bash
 cd "$(grove go feature/login --path-only)"
 ```
 
-Do **not** rely on bare `grove go` in non-interactive mode. Without shell integration it spawns a child shell; without a TTY the fuzzy picker errors out.
+`grove go` only sets `GROVE_WORKTREE` when it launches a child shell - that is, in interactive mode. In agent mode you stay in the parent process, so don't rely on the env var.
 
-The `GROVE_WORKTREE` environment variable is set to the branch name only when grove launches a child shell (interactive mode).
-
-## Listing and discovery
-
-```bash
-grove list               # human-friendly list (alias: grove ls)
-grove list --json        # machine-readable - parse this from agents
-grove list --details     # extra columns
-grove list --dirty       # only worktrees with uncommitted changes
-grove list --locked      # only locked worktrees
-```
-
-Use `--json` whenever the agent needs to enumerate or branch on worktree state programmatically. Do not screen-scrape the human-formatted output.
-
-## Pull request workflow
-
-Check out a PR head into a fresh worktree (requires the `gh` CLI to be installed and authenticated):
+## Pull request checkout
 
 ```bash
 grove pr 42
 ```
 
-This creates a worktree for the PR branch using the same naming rules as `grove add`. Use this whenever the task is to review, test, or extend a specific PR.
+Creates a worktree for the head branch of PR #42 using the same naming rules as `grove add`. Requires the `gh` CLI to be installed and authenticated. Use this whenever the task is "review PR 42", "test the changes in PR 42", or anything else that means "I need this PR's code locally" - it is much faster than fetching the PR ref by hand.
+
+## Listing and discovery
+
+```bash
+grove list             # human-friendly (alias: grove ls)
+grove list --json      # machine-readable - parse this from agents
+grove list --details   # extra columns
+grove list --dirty     # only worktrees with uncommitted changes
+grove list --locked    # only locked worktrees
+```
+
+When an agent needs to enumerate or branch on worktree state, use `--json`. The human-formatted table is for humans.
 
 ## Cleanup
 
-Remove a single worktree:
+Remove specific worktrees:
 
 ```bash
 grove remove feature/new-thing       # alias: grove rm
 grove remove feat-a feat-b           # multiple at once
 grove remove feat-a --force          # even with uncommitted changes
-grove remove feat-a --yes            # skip confirmation prompt
+grove remove feat-a --yes            # skip confirmation
 ```
 
-Bulk-remove worktrees whose branches were merged to main:
+Bulk-remove worktrees whose branches were merged to the trunk:
 
 ```bash
 grove prune --dry-run                # always preview first
-grove prune                          # actually do it
+grove prune                          # apply
 grove prune --base develop           # different trunk
-grove prune --older-than 30d         # bypasses merge check; uses age instead
-grove prune --older-than 6M --dry-run
+grove prune --older-than 30d         # bypass merge check; use age
+grove prune --older-than P30D        # ISO 8601 duration also works
 grove prune --force                  # ignore dirty worktrees
 ```
 
-`--older-than` and `--base` cannot be combined. Duration accepts human-friendly (`30d`, `2w`, `6M`, `1y`) or ISO-8601 (`P30D`, `P2W`, `P6M`, `P1Y`) format.
+`--older-than` and `--base` cannot be combined.
 
-**Agent rule:** always run `grove prune --dry-run` first and show the plan before actually pruning. Pruning is destructive and the merge-detection heuristics are not perfect.
+The dry-run is not optional in practice. `grove prune` decides what's safe to remove using merge detection, and squashes, rebases, force-pushes, and PR-only branches each confuse the heuristic in different ways. Show the dry-run output to the user, get confirmation, then apply.
 
-## `.groverc` bootstrap
+## .groverc bootstrap
 
 A `.groverc` at the project root configures grove for that project:
 
@@ -191,17 +215,17 @@ A `.groverc` at the project root configures grove for that project:
 }
 ```
 
-When `grove add` creates a new worktree, every command runs in order inside it. Constraints:
+When `grove add` creates a worktree, every command runs in order inside the new directory. Three constraints:
 
-- Cross-platform - must work on Linux, macOS, and Windows.
-- Executable plus args only. No shell metacharacters (`|`, `&&`, `>`, etc.).
+- Cross-platform - the same `.groverc` should work on Linux, macOS, and Windows.
+- Executable plus args only. No shell metacharacters (`|`, `&&`, `>`, `;`). If you need shell features, run a script and put the shell features inside the script.
 - Failures are reported but do not abort the remaining commands.
 
-Use this so new worktrees are immediately ready to build/test without a manual install step.
+This is the right place to centralize "every new worktree needs `npm install` and a `cargo check`". It saves the agent from reinventing the install dance for each new worktree.
 
-## Shell integration
+## Shell integration (humans)
 
-For interactive humans, `grove go` is more useful when it changes the current directory instead of spawning a child shell. Set up integration once:
+For interactive humans, `grove go` is more useful when it changes the cwd directly instead of spawning a child shell:
 
 ```bash
 echo 'eval "$(grove shell-init bash)"'  >> ~/.bashrc
@@ -209,33 +233,86 @@ echo 'eval "$(grove shell-init zsh)"'   >> ~/.zshrc
 echo 'eval "$(grove shell-init fish)"'  >> ~/.config/fish/config.fish
 ```
 
-Windows PowerShell is supported (`pwsh`, `powershell`).
+PowerShell is also supported (`pwsh`, `powershell`).
 
-Agents should **not** depend on shell integration. Use `--path-only` (see **Switching to existing work**) instead.
+Agents should not depend on shell integration being installed - use `--path-only` (see **Switching to existing work**).
 
 ## Branch naming tips
 
 - Plain names (`feature/login`, `bugfix/123`) work as both branch name and worktree directory name.
-- `--track origin/some-branch` lets you check out an existing remote branch under a different local name if you want.
-- Auto-generated names (`grove add` with no args) are great for short exploratory branches; combined with `branchPrefix` you get `<user>/quiet-meadow`-style namespacing for free.
-- Avoid characters grove rejects: `<`, `>`, `:`, `"`, `|`, `?`, `*`, and path-traversal sequences (`..`, absolute paths).
+- `--track origin/some-branch` lets you check out an existing remote branch under a different local name.
+- Auto-generated names are great for ad-hoc experiments; combined with `branchPrefix`, you get `<user>/<adjective>-<noun>` namespacing for free.
+- Grove rejects these characters in branch names: `<`, `>`, `:`, `"`, `|`, `?`, `*`, plus path-traversal sequences (`..`, absolute paths). These are the characters Windows filesystems can't represent, so the rule keeps repos portable.
 
-## What grove is NOT
+## Examples
 
-Grove orchestrates worktrees. It does not replace `git`. From inside a worktree keep using:
+**Clone and start a feature**
+
+User task: *"Clone https://github.com/foo/bar and add a feature branch for OAuth, then drop me into it."*
+
+```bash
+grove init https://github.com/foo/bar.git
+cd bar
+grove add feature/oauth
+cd "$(grove go feature/oauth --path-only)"
+```
+
+**Switch tasks**
+
+User task: *"I need to look at my login work."*
+
+```bash
+cd "$(grove go login --path-only)"
+```
+
+The partial match resolves to whichever worktree contains "login" in its branch name. If multiple match, fall back to the full name.
+
+**Review a PR**
+
+User task: *"Pull down PR 142 so I can run the tests."*
+
+```bash
+grove pr 142
+# grove pr prints the new worktree path on success - cd into it,
+# or use grove go --path-only with the new branch name.
+```
+
+**Cleanup at end of week**
+
+User task: *"Clean up branches I'm done with."*
+
+```bash
+grove prune --dry-run
+# Show the user what would be removed; ask for confirmation.
+grove prune
+```
+
+**Encounter a non-grove repo**
+
+User task (executed inside a plain `git clone`): *"Switch to my login branch in this repo I cloned last month."*
+
+Detection finds no `<name>.git/` and no `.groverc` - this is a plain clone. Tell the user grove won't work here without a re-clone, offer the migration recipe, and proceed with `git switch login` (or whatever they prefer) if they decline.
+
+## What grove does and does not do
+
+Grove owns: project layout (`init`), worktree lifecycle (`add`, `remove`, `prune`, `pr`), navigation (`go`), discovery (`list`), and upstream sync (`sync`).
+
+Grove does not replace `git` or `gh`. From inside a worktree, keep using:
 
 - `git status`, `git diff`, `git add`, `git commit`, `git push`
 - `git rebase`, `git merge`, `git cherry-pick`
-- `gh pr create`, `gh issue list`, and so on
+- `gh pr create`, `gh issue list`, `gh pr review`
 
-Grove owns: project layout (`init`), worktree creation and removal (`add`, `remove`, `prune`), navigation (`go`), discovery (`list`), upstream sync (`sync`), and PR checkout (`pr`).
+If you reach for `git worktree add`, that's the cue to use `grove add` instead - grove keeps a consistent directory layout that the rest of these commands depend on. If you reach for `git clone` and the user wants the grove workflow, use `grove init`. If you want to `cd` into the `<name>.git/` bare clone to do work, redirect into a worktree - the bare clone has no working tree, only refs.
 
-## Common pitfalls
+## Why these constraints exist
 
-- **Don't `git clone`** when `grove init` is appropriate. The layouts are not interchangeable.
-- **Don't `git worktree add` directly.** Grove maintains a consistent directory layout and bookkeeping; sidestepping it leaves entries `grove list` will not track correctly.
-- **Don't `cd` into the `<name>.git/` bare clone to do work.** It is bare - there is no working tree. Always work inside a worktree directory.
-- **Don't run `grove` against a normal non-bare clone.** Discovery will fail. That is the cue to either re-clone with `grove init` or fall back to plain git for that project.
-- **Always `grove prune --dry-run` first.** Pruning is destructive.
-- **`grove sync` only updates the bare clone.** Worktrees still need their own `git pull`/`git rebase` if you want them on the new tip.
-- **Avoid running long-lived processes from inside `<name>.git/`.** Build, test, and lint commands belong inside a worktree directory so they see actual source files.
+A few rules earn their keep:
+
+- **Don't run grove against a non-bare clone.** Discovery walks up looking for the bare-clone signature; in a normal clone it won't find one and every grove command will fail. That's a feature - grove is telling you the layout is wrong, not the command.
+
+- **Don't `git worktree add` in a grove-managed repo.** Grove tracks worktrees through git's standard mechanisms, so a hand-rolled `git worktree add` will appear in `grove list` - but the directory layout, branch naming, and bootstrap won't match. The inconsistency bites later.
+
+- **Always preview pruning.** `grove prune` decides what's safe to remove based on merge detection, and the heuristics aren't perfect. The dry-run is the chance to catch a false positive before a worktree is gone.
+
+- **`grove sync` is not `git pull`.** It updates only the bare clone's ref for the named branch. Worktrees stay where they were until you pull or rebase them yourself. This is intentional - one stale worktree shouldn't block syncing the rest of the project.
