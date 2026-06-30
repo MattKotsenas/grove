@@ -35,14 +35,19 @@ If the user is in plain `git clone` territory and grove is not yet involved, see
 
 ## Agent-mode rule of thumb
 
-In a non-interactive CLI agent context (no TTY, no shell integration), keep these two patterns ready:
+In a non-interactive CLI agent context (no TTY, no shell integration), keep two patterns ready: move into a worktree by its path, and read state as JSON.
+
+`grove go --path-only` prints the target path to stdout and nothing else, so command substitution moves you there. This form is identical in bash and PowerShell:
 
 ```bash
-# Get a worktree path without spawning a shell:
-WORKTREE=$(grove go feature/login --path-only)
-cd "$WORKTREE"
+cd "$(grove go feature/login --path-only)"
+```
 
-# Enumerate worktrees programmatically:
+To reuse the path, capture it with your shell's own syntax - bash `wt=$(grove go feature/login --path-only)`, PowerShell `$wt = grove go feature/login --path-only`.
+
+Enumerate worktrees programmatically:
+
+```bash
 grove list --json
 ```
 
