@@ -1,19 +1,21 @@
 ---
 name: grove-workflow
 description: |
-  Manage git worktrees with the grove CLI for fast multi-branch
-  workflows - work on several branches simultaneously without stashing
-  or branch-switching. Use this skill whenever the user asks to clone a
-  repository (prefer `grove init` over `git clone`), start a new feature
-  or bugfix branch, switch between in-progress branches, check out a
-  pull request, or clean up merged worktrees. Also use it when you land
-  in a project that already has a bare-clone-plus-worktrees layout.
-  Trigger this skill even when the user does not say "grove" or
-  "worktree" by name - any task that involves cloning, branching,
-  juggling several in-flight changes, or PR review is a strong signal.
-  Covers detection of grove-managed repos, agent-friendly
-  non-interactive patterns (`--path-only`, `--json`), and handling
-  pre-existing non-grove repos.
+  Use grove to obtain and manage a git repo as worktrees - every branch
+  in its own directory, no stashing or branch-switching. Reach for it
+  first whenever you need a local copy of a repo: before running
+  `git clone`, prefer `grove init`. However the need arises: the user
+  says "clone", hands you a URL, or you (an agent) decide you need the
+  code locally to read, build, or debug. Also use grove to add a
+  feature or bugfix branch, switch between in-progress branches, check
+  out a pull request, list worktrees, or clean up the ones you're
+  finished with. The same when you land in a `<name>.git/` bare clone
+  beside worktree directories. Do not wait for the words "grove" or
+  "worktree" - cloning, branching, juggling in-flight changes, or PR
+  review are strong signals. It is not for read-only GitHub lookups
+  that need no local checkout: license, README, issues, releases, or
+  code search. Covers grove-repo detection, agent-friendly flags
+  (`--path-only`, `--json`), and migrating a pre-existing plain clone.
 ---
 
 # Grove Workflow
