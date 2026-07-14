@@ -215,7 +215,52 @@ pub fn clone_bare_repository(git_url: &str, target_dir: &str) -> Result<(), Stri
         return Err(format!("Failed to configure repository: {}", stderr.trim()));
     }
 
+    // Populate refs/remotes/origin/* so subsequent commands (sync, --track,
+    // get_default_branch, auto-upstream in add) can resolve origin/<branch>
+    // without requiring the user to run an extra `git fetch origin`.
+    let output = build_fetch_origin_command(target_dir)
+        .output()
+        .map_err(|e| format!("Failed to fetch from origin: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to fetch from origin: {}", stderr.trim()));
+    }
+
+    // Set refs/remotes/origin/HEAD so get_default_branch and downstream tools
+    // can resolve the remote's default branch. Failure here is non-fatal:
+    // older Git versions or unusual remote configurations may not support it,
+    // and the fallback in get_default_branch still works.
+    let _ = build_set_head_command(target_dir).output();
+
     Ok(())
+}
+
+/// Build the `git fetch origin` invocation that runs against the
+/// just-cloned bare repository during `clone_bare_repository`.
+///
+/// Wrapped in its own function (rather than inlined) so that a unit test
+/// can assert the command goes through `build_git_command(BareRepo(..))`
+/// and not the older `current_dir(target_dir)` pattern. The `current_dir`
+/// pattern breaks under `safe.bareRepository=explicit` because git's
+/// CWD-based bare-repo discovery is disabled by that setting; the
+/// `BareRepo` target sets `GIT_DIR` instead, which is unaffected.
+fn build_fetch_origin_command(target_dir: &str) -> Command {
+    build_git_command(
+        GitTarget::BareRepo(Path::new(target_dir)),
+        &["fetch", "origin"],
+    )
+}
+
+/// Build the `git remote set-head origin --auto` invocation that runs
+/// against the just-cloned bare repository during
+/// `clone_bare_repository`. See [`build_fetch_origin_command`] for the
+/// rationale on going through the `BareRepo` funnel.
+fn build_set_head_command(target_dir: &str) -> Command {
+    build_git_command(
+        GitTarget::BareRepo(Path::new(target_dir)),
+        &["remote", "set-head", "origin", "--auto"],
+    )
 }
 
 pub fn add_worktree(
@@ -245,8 +290,75 @@ pub fn add_worktree(
     git_raw(context, &args).map_err(|e| format!("Failed to add worktree: {}", e))?;
     if let Some(track_branch) = normalized_track.as_deref() {
         set_branch_upstream(context, branch_name, track_branch)?;
+    } else {
+        maybe_set_default_upstream(context, branch_name);
     }
     Ok(())
+}
+
+/// Set upstream tracking to `origin/<branch_name>` when grove can infer
+/// that's what the user wants.
+///
+/// Rationale: bare-clone + worktree workflows produce local branches
+/// that have no upstream. `refs/heads/*` are created by `git clone
+/// --bare` without tracking info, which breaks `git push` / `git
+/// status` until the user runs `git branch -u origin/<branch>`. This
+/// helper sets the upstream automatically when
+/// `refs/remotes/origin/<branch>` exists and the local branch doesn't
+/// already have one. That's more eager than `git checkout` (which only
+/// auto-tracks when *creating* a new branch from a remote-tracking
+/// ref), but matches the workflow grove encapsulates.
+///
+/// Users who have set `branch.autoSetupMerge=false` are signaling they
+/// don't want this class of auto-tracking, so we honor it as an
+/// opt-out.
+///
+/// All conditions are pre-checks; nothing fails loudly. Worst case: no
+/// upstream is set and the user runs `git branch -u origin/<branch>`
+/// themselves, which is what they'd do today without this helper.
+fn maybe_set_default_upstream(context: &RepoContext, branch_name: &str) {
+    if auto_setup_merge_disabled(context) {
+        return;
+    }
+
+    let remote_ref = format!("refs/remotes/origin/{}", branch_name);
+    if !reference_exists(context, &remote_ref) {
+        return;
+    }
+
+    if branch_has_upstream(context, branch_name) {
+        return;
+    }
+
+    let upstream = format!("origin/{}", branch_name);
+    let _ = git_raw(
+        context,
+        &["branch", "--set-upstream-to", &upstream, branch_name],
+    );
+}
+
+fn auto_setup_merge_disabled(context: &RepoContext) -> bool {
+    // `branch.autoSetupMerge` defaults to "true". Only an explicit "false"
+    // (case-insensitive, optionally with surrounding whitespace) disables
+    // auto-tracking. Other documented values ("true", "always", "simple",
+    // "inherit") leave grove's behavior unchanged.
+    match git_raw(context, &["config", "--get", "branch.autoSetupMerge"]) {
+        Ok(value) => value.trim().eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+fn branch_has_upstream(context: &RepoContext, branch_name: &str) -> bool {
+    git_raw(
+        context,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            &format!("{}@{{u}}", branch_name),
+        ],
+    )
+    .is_ok()
 }
 
 fn build_add_worktree_args<'a>(
@@ -1024,6 +1136,91 @@ mod tests {
                 OsStr::new("worktree"),
                 OsStr::new("list"),
                 OsStr::new("--porcelain"),
+            ]
+        );
+    }
+
+    // The two helpers below cover the post-clone steps in
+    // `clone_bare_repository`: `git fetch origin` and
+    // `git remote set-head origin --auto`. Both run against a bare
+    // repository that has just been cloned by `git clone --bare`.
+    //
+    // They are tested separately (instead of inline in
+    // `clone_bare_repository`) because the bug they guard against is a
+    // pattern-level bug: a future contributor could re-introduce the
+    // `Command::new("git").current_dir(target_dir)` shape, which works
+    // under default git config but breaks silently under
+    // `safe.bareRepository=explicit`. Asserting the constructed `Command`
+    // here means CI catches that regression without needing a real bare
+    // repo on disk or a CI runner with `safe.bareRepository=explicit`
+    // pre-set.
+
+    #[test]
+    fn build_fetch_origin_command_uses_bare_repo_target() {
+        let target_dir = "/tmp/grove-test/just-cloned.git";
+        let cmd = build_fetch_origin_command(target_dir);
+
+        // GIT_DIR must be set (BareRepo target). The historical bug used
+        // current_dir(target_dir) instead, which breaks under
+        // safe.bareRepository=explicit because that setting disables
+        // git's CWD-based bare-repo discovery.
+        let git_dir = cmd
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("GIT_DIR"))
+            .and_then(|(_, value)| value);
+        assert_eq!(
+            git_dir,
+            Some(OsStr::new(target_dir)),
+            "fetch-origin command must identify the bare repo via GIT_DIR \
+             (not via current_dir) so it works under \
+             safe.bareRepository=explicit"
+        );
+
+        assert!(
+            cmd.get_current_dir().is_none(),
+            "fetch-origin command must not set current_dir on the bare repo \
+             path; that re-enables the safe.bareRepository=explicit failure \
+             mode. Got current_dir={:?}",
+            cmd.get_current_dir()
+        );
+
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+        assert_eq!(args, vec![OsStr::new("fetch"), OsStr::new("origin")]);
+    }
+
+    #[test]
+    fn build_set_head_command_uses_bare_repo_target() {
+        let target_dir = "/tmp/grove-test/just-cloned.git";
+        let cmd = build_set_head_command(target_dir);
+
+        let git_dir = cmd
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("GIT_DIR"))
+            .and_then(|(_, value)| value);
+        assert_eq!(
+            git_dir,
+            Some(OsStr::new(target_dir)),
+            "set-head command must identify the bare repo via GIT_DIR \
+             (not via current_dir) so it works under \
+             safe.bareRepository=explicit"
+        );
+
+        assert!(
+            cmd.get_current_dir().is_none(),
+            "set-head command must not set current_dir on the bare repo \
+             path; that re-enables the safe.bareRepository=explicit failure \
+             mode. Got current_dir={:?}",
+            cmd.get_current_dir()
+        );
+
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                OsStr::new("remote"),
+                OsStr::new("set-head"),
+                OsStr::new("origin"),
+                OsStr::new("--auto"),
             ]
         );
     }
