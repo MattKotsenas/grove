@@ -186,6 +186,8 @@ fn is_squash_merged(
 }
 
 pub fn clone_bare_repository(git_url: &str, target_dir: &str) -> Result<(), String> {
+    check_worktree_config_support()?;
+
     let output = build_git_command(
         GitTarget::Unbound,
         &["clone", "--bare", git_url, target_dir],
@@ -197,6 +199,8 @@ pub fn clone_bare_repository(git_url: &str, target_dir: &str) -> Result<(), Stri
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("Failed to clone repository: {}", stderr.trim()));
     }
+
+    initialize_worktree_config(Path::new(target_dir))?;
 
     // Configure fetch refspec
     let output = build_git_command(
@@ -234,6 +238,99 @@ pub fn clone_bare_repository(git_url: &str, target_dir: &str) -> Result<(), Stri
     let _ = build_set_head_command(target_dir).output();
 
     Ok(())
+}
+
+fn check_worktree_config_support() -> Result<(), String> {
+    // --get selects the full option help on Git versions with config subcommands.
+    let output = build_git_command(GitTarget::Unbound, &["config", "--get", "-h"])
+        .output()
+        .map_err(|e| format!("Failed to check Git worktree configuration support: {}", e))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() && output.status.code() != Some(129) {
+        return Err(format!(
+            "Failed to check Git worktree configuration support ({}): {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let supported = stdout
+        .split_whitespace()
+        .chain(stderr.split_whitespace())
+        .any(|option| matches!(option, "--worktree" | "--[no-]worktree"));
+    if !supported {
+        return Err(
+            "grove init requires Git 2.20 or newer: per-worktree configuration is unavailable"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Enable isolated configuration before the new bare clone has linked worktrees.
+fn initialize_worktree_config(repo_path: &Path) -> Result<(), String> {
+    let bare = read_local_config(repo_path, "core.bare", true)?;
+    let worktree = read_local_config(repo_path, "core.worktree", false)?;
+    let format = read_local_config(repo_path, "core.repositoryFormatVersion", false)?;
+
+    let configure = |args: &[&str]| -> Result<(), String> {
+        let mut command_args = vec!["config"];
+        command_args.extend_from_slice(args);
+        let output = build_git_command(GitTarget::BareRepo(repo_path), &command_args)
+            .output()
+            .map_err(|e| format!("Failed to initialize worktree configuration: {}", e))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Failed to initialize worktree configuration: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
+    };
+
+    // Format 1 makes clients that do not recognize worktreeConfig reject the
+    // repository instead of silently ignoring its per-worktree configuration.
+    if format.as_deref() == Some("0") || format.is_none() {
+        configure(&["--local", "core.repositoryFormatVersion", "1"])?;
+    }
+    configure(&["--local", "extensions.worktreeConfig", "true"])?;
+
+    // Leave an explicit false in shared config: it may override a global true.
+    if bare.as_deref() == Some("true") {
+        configure(&["--worktree", "core.bare", "true"])?;
+        configure(&["--local", "--unset-all", "core.bare"])?;
+    }
+    if let Some(worktree) = worktree {
+        configure(&["--worktree", "core.worktree", &worktree])?;
+        configure(&["--local", "--unset-all", "core.worktree"])?;
+    }
+    Ok(())
+}
+
+fn read_local_config(repo_path: &Path, key: &str, boolean: bool) -> Result<Option<String>, String> {
+    let mut args = vec!["config", "--local", "--get"];
+    if boolean {
+        args.push("--bool");
+    }
+    args.push(key);
+    let output = build_git_command(GitTarget::BareRepo(repo_path), &args)
+        .output()
+        .map_err(|e| format!("Failed to read repository configuration: {}", e))?;
+    if output.status.success() {
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout)
+                .trim_end_matches(['\r', '\n'])
+                .to_owned(),
+        ))
+    } else if output.status.code() == Some(1) {
+        Ok(None)
+    } else {
+        Err(format!(
+            "Failed to read {}: {}",
+            key,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 /// Build the `git fetch origin` invocation that runs against the
