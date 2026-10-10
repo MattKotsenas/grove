@@ -101,6 +101,40 @@ fn build_git_command(target: GitTarget<'_>, args: &[&str]) -> Command {
     cmd
 }
 
+/// Return the validated bare repository for a worktree.
+pub(crate) fn bare_repository_from_worktree(worktree_path: &Path) -> Option<PathBuf> {
+    let output = build_git_command(
+        GitTarget::WorkTree(worktree_path),
+        &["rev-parse", "--git-common-dir"],
+    )
+    .output()
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let common_dir = PathBuf::from(
+        String::from_utf8(output.stdout)
+            .ok()?
+            .trim_end_matches(['\r', '\n']),
+    );
+    // Git may return a relative path. Canonicalize before using it as GIT_DIR,
+    // particularly on Windows where extended-length paths do not resolve `..`.
+    let common_dir = fs::canonicalize(worktree_path.join(common_dir)).ok()?;
+    is_bare_repository(&common_dir).then_some(common_dir)
+}
+
+pub(crate) fn is_bare_repository(repo_path: &Path) -> bool {
+    build_git_command(
+        GitTarget::BareRepo(repo_path),
+        &["rev-parse", "--is-bare-repository"],
+    )
+    .output()
+    .map(|output| {
+        output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+    })
+    .unwrap_or(false)
+}
+
 fn git_raw(context: &RepoContext, args: &[&str]) -> Result<String, String> {
     let output = build_git_command(GitTarget::BareRepo(&context.repo_path), args)
         .output()
