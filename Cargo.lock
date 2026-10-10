@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "grove"
-version = "1.4.0"
+version = "2.2.0"
 dependencies = [
  "atty",
  "chrono",
